@@ -1,0 +1,856 @@
+---
+title: "MasterControl Lead Progression Modeling"
+author: "Adam Edwards, An Lee, Brian Frerichs, Kun Joo Cho"
+date: "2026-03-13"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    number_sections: true
+  output:
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+## Business Problem
+
+MasterControl provides quality and manufacturing management software to life sciences companies. Their two main products are:
+
+- **Qx (Quality solutions)**: 20+ years in market, ~19.7% lead progression rate
+- **Mx (Manufacturing solutions)**: ~4 years in market, ~12.7% lead progression rate
+
+Sales resources are limited. The goal is to build a predictive model that identifies which leads are most likely to progress, so that sales teams can prioritize the highest-potential opportunities — especially for the underperforming Mx product.
+
+## Analytic Problem
+
+We aim to build a binary classification model predicting whether a lead progresses to a successful sales stage (SQL, SQO, or Won). 
+
+- **Target variable**: `next_stage_c` (binarized: 1 = progressed, 0 = not progressed)
+- **Baseline rate**: ~18.45% overall progression
+- **Key challenge**: Mx product significantly underperforms Qx; we want to understand and model this gap
+
+# Data Preparation
+
+## Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(vip)
+library(ranger)
+library(xgboost)
+library(glmnet)
+```
+
+## Load & Rename
+
+```{r Load-Data}
+df_raw <- read_csv("Mastercontrol QAL Performance.csv")
+
+df <- df_raw %>%
+  rename(
+    site_function = 'acct primary site function',
+    mfg_model     = 'acct manufacturing model',
+    industry      = 'acct target industry',
+    lead_title    = 'contact/lead title',
+    lead_id       = 'contact/lead id',
+    next_stage    = 'next_stage__c',
+    territory     = 'acct territory rollup',
+    tier          = 'acct tier rollup',
+    channel       = 'last tactic campaign channel',
+    cohort_date   = 'qal cohort date'
+  )
+
+```
+
+## Create Binary Target
+
+```{r Target}
+df_model <- df %>%
+  filter(!is.na(next_stage)) %>%
+  mutate(
+    progressed = factor(
+      if_else(next_stage %in% c("SQL", "SQO", "Won"), "Yes", "No"),
+      levels = c("Yes", "No")
+    )
+  )
+
+table(df_model$progressed)
+prop.table(table(df_model$progressed))
+```
+
+## Feature Engineering
+
+```{r Features Engineering}
+df_model <- df_model %>%
+  mutate(
+    cohort_date  = as.Date(cohort_date, format = "%m/%d/%Y"),
+    cohort_month = month(cohort_date),
+    cohort_qtr   = quarter(cohort_date),
+    cohort_year  = year(cohort_date),
+
+    title_upper = str_to_upper(lead_title),
+
+    seniority = case_when(
+      str_detect(title_upper, "CEO|CTO|COO|CFO|CHIEF|PRESIDENT|OWNER|FOUNDER") ~ "C-Level",
+      str_detect(title_upper, "\\bVP\\b|VICE PRESIDENT")                       ~ "VP",
+      str_detect(title_upper, "DIRECTOR|DIR\\b")                               ~ "Director",
+      str_detect(title_upper, "MANAGER|MGR\\b")                                ~ "Manager",
+      str_detect(title_upper, "SENIOR|SR\\.|LEAD\\b|PRINCIPAL")                ~ "Senior/Lead",
+      str_detect(title_upper, "SPECIALIST|ANALYST|COORDINATOR|ENGINEER|SCIENTIST") ~ "Technical",
+      !is.na(lead_title) ~ "Other",
+      TRUE ~ "Unknown"
+    ),
+
+    func_area = case_when(
+      str_detect(title_upper, "QUALITY|QA\\b|QC\\b|COMPLIANCE|VALIDATION") ~ "Quality",
+      str_detect(title_upper, "REGULAT|RA\\b|AFFAIRS")                      ~ "Regulatory",
+      str_detect(title_upper, "MANUFACTUR|OPERAT|PRODUC|SUPPLY CHAIN")      ~ "Operations/Mfg",
+      str_detect(title_upper, "IT\\b|INFORMATION|SYSTEM|TECHNOLOG|DATA")    ~ "IT/Systems",
+      str_detect(title_upper, "RESEARCH|R&D|DEVELOP|SCIENTIST|CLINICAL")    ~ "R&D",
+      str_detect(title_upper, "ENGINEER")                                    ~ "Engineering",
+      !is.na(lead_title) ~ "Other",
+      TRUE ~ "Unknown"
+    ),
+
+    kw_quality_cluster = as.integer(str_detect(title_upper, "QUALITY|\\bQA\\b|\\bQC\\b|COMPLIANCE|VALIDATION")),
+    kw_mfg_cluster     = as.integer(str_detect(title_upper, "MANUFACTUR|OPERAT|PRODUC|SUPPLY CHAIN")),
+
+    is_senior_decision_maker = as.integer(seniority %in% c("C-Level", "VP")),
+
+    is_quality_or_ops = as.integer(func_area %in% c("Quality", "Operations/Mfg")),
+
+    high_intent    = as.integer(str_detect(Priority, "P1 -|Priority 1")),
+    is_pricing_req = as.integer(str_detect(Priority, "Pricing")),
+    is_demo_req    = as.integer(str_detect(Priority, "Demo|Video Demo|Live Demo")),
+
+    organic_channel = as.integer(channel %in% c("SEO", "Direct/Inbound")),
+
+    is_americas = as.integer(territory == "Americas"),
+
+    is_small_med = as.integer(tier %in% c("Small", "Medium")),
+
+    is_target_industry_mx = as.integer(industry %in% c("Medical Device", "Blood & Biologics")),
+
+    site_function = replace_na(site_function, "Missing"),
+    mfg_model     = replace_na(mfg_model, "Missing"),
+    industry      = replace_na(industry, "Unknown"),
+    territory     = replace_na(territory, "Unknown"),
+    tier          = replace_na(tier, "Unknown"),
+    channel       = replace_na(channel, "Unknown"),
+
+    mfg_model_grp  = fct_lump_n(factor(mfg_model), n = 10, other_level = "Other"),
+    channel_grp    = fct_lump_n(factor(channel),    n = 8,  other_level = "Other"),
+    priority_grp   = fct_lump_n(factor(Priority),   n = 8,  other_level = "Other"),
+    industry_grp   = factor(industry),
+    territory_grp  = factor(territory),
+    tier_grp       = factor(tier),
+    seniority_grp  = factor(seniority),
+    func_area_grp  = factor(func_area),
+    product_grp    = factor(solution_rollup)
+  )
+```
+
+```{r Correlation & Progression}
+cor_check <- df_model %>%
+  mutate(across(c(kw_quality_cluster, kw_mfg_cluster,
+                  high_intent, organic_channel), as.integer)) %>%
+  select(kw_quality_cluster, kw_mfg_cluster,
+         high_intent, organic_channel) %>%
+  cor(use = "complete.obs")
+
+print(cor_check)
+
+df_model %>%
+  group_by(func_area_grp, product_grp) %>%
+  summarise(n = n(),
+            prog = mean(progressed == "Yes"),
+            .groups = "drop") %>%
+  filter(product_grp == "Mx", n >= 30) %>%
+  arrange(desc(prog))
+
+
+month_prog <- df_model %>%
+  group_by(cohort_month, product_grp) %>%
+  summarise(n = n(),
+            prog_rate = mean(progressed == "Yes"),
+            .groups = "drop") %>%
+  filter(product_grp %in% c("Mx", "Qx"), n >= 20)
+
+ggplot(month_prog,
+       aes(x = cohort_month, y = prog_rate,
+           color = product_grp, group = product_grp)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 1:12,
+    labels = c("Jan","Feb","Mar","Apr","May","Jun",
+               "Jul","Aug","Sep","Oct","Nov","Dec")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Monthly Progression Rate (Mx vs Qx)",
+      x = "Lead Cohort Month", y = "Progression Rate", color = "Product") +
+  theme_minimal()
+
+df_model %>%
+  filter(product_grp == "Mx") %>%
+  group_by(cohort_year) %>%
+  summarise(n = n(),
+            prog_rate = mean(progressed == "Yes"),
+            .groups = "drop")
+```
+
+```{r Site Function Tiering}
+site_rates <- df_model %>%
+  group_by(site_function) %>%
+  summarise(n = n(), prog_rate = mean(progressed == "Yes"), .groups = "drop") %>%
+  filter(n >= 20) %>%
+  mutate(site_func_tier = case_when(
+    prog_rate >= 0.30 ~ "High",
+    prog_rate >= 0.18 ~ "Mid",
+    TRUE              ~ "Low"
+  )) %>%
+  select(site_function, site_func_tier)
+
+df_model <- df_model %>%
+  left_join(site_rates, by = "site_function") %>%
+  mutate(
+    site_func_tier = replace_na(site_func_tier, "Unknown"),
+    site_func_tier = factor(site_func_tier, levels = c("High", "Mid", "Low", "Unknown"))
+  )
+```
+
+## Select Final Features
+
+```{r Select-Features}
+df_final <- df_model %>%
+  select(
+    progressed,
+    product_grp,
+    site_func_tier,
+    industry_grp, is_target_industry_mx,
+    mfg_model_grp,
+    tier_grp, is_small_med,
+    territory_grp, is_americas,
+    seniority_grp, is_senior_decision_maker,
+    func_area_grp, is_quality_or_ops,
+    kw_quality_cluster, kw_mfg_cluster,
+    priority_grp, high_intent, is_pricing_req, is_demo_req,
+    channel_grp, organic_channel,
+    cohort_month, cohort_qtr, cohort_year
+  )
+```
+
+```{r Eefine Clustering}
+df_model <- df_model %>%
+  mutate(
+    kw_qa           = as.integer(str_detect(title_upper, "\\bQA\\b|\\bQC\\b")),
+    kw_compliance   = as.integer(str_detect(title_upper, "COMPLIANCE|COMPLI")),
+    kw_validation   = as.integer(str_detect(title_upper, "VALIDATION|VALIDAT")),
+    kw_operations   = as.integer(str_detect(title_upper, "OPERAT")),
+    kw_supply_chain = as.integer(str_detect(title_upper, "SUPPLY CHAIN")),
+    kw_quality_cluster = as.integer(kw_qa | kw_compliance | kw_validation),
+    kw_mfg_cluster     = as.integer(kw_operations | kw_supply_chain)
+  )
+
+kw_cols <- c("kw_qa", "kw_compliance", "kw_validation",
+             "kw_operations", "kw_quality_cluster", "kw_mfg_cluster")
+
+map_dfr(kw_cols, function(col) {
+  df_model %>%
+    group_by(flag = .data[[col]]) %>%
+    summarise(n = n(), prog_rate = mean(progressed == "Yes"), .groups = "drop") %>%
+    mutate(keyword = col)
+}) %>%
+  filter(flag == 1) %>%
+  select(keyword, n, prog_rate) %>%
+  arrange(desc(prog_rate))
+```
+
+```{r Clean Site Tiers}
+
+site_rates <- df_model %>%
+  group_by(site_function) %>%
+  summarise(n = n(), prog_rate = mean(progressed == "Yes"), .groups = "drop") %>%
+  filter(n >= 20)
+
+site_groups <- site_rates %>%
+  mutate(
+    site_func_tier = case_when(
+      prog_rate >= 0.30 ~ "High",
+      prog_rate >= 0.18 ~ "Mid",
+      TRUE              ~ "Low"
+    )
+  ) %>%
+  select(site_function, site_func_tier)
+
+# Remove site_func_tier columns only if they exist
+df_model <- df_model %>%
+  select(-any_of(c("site_func_tier", "site_func_tier.x", "site_func_tier.y")))
+
+# Compute progression rate per site function (min 20 samples)
+site_rates <- df_model %>%
+  group_by(site_function) %>%
+  summarise(n = n(), prog_rate = mean(progressed == "Yes"), .groups = "drop") %>%
+  filter(n >= 20)
+
+site_groups <- site_rates %>%
+  mutate(
+    site_func_tier = case_when(
+      prog_rate >= 0.30 ~ "High",
+      prog_rate >= 0.18 ~ "Mid",
+      TRUE              ~ "Low"
+    )
+  ) %>%
+  select(site_function, site_func_tier)
+
+df_model <- df_model %>%
+  left_join(site_groups, by = "site_function") %>%
+  mutate(
+    site_func_tier = replace_na(site_func_tier, "Unknown"),
+    site_func_tier = factor(site_func_tier, levels = c("High", "Mid", "Low", "Unknown"))
+  )
+
+# Verify
+df_model %>%
+  group_by(site_func_tier) %>%
+  summarise(n = n(), prog_rate = mean(progressed == "Yes"), .groups = "drop")
+```
+
+# Plots of MX Relationships
+
+```{r}
+# Keep only Mx leads from the processed dataset
+mx <- df_final %>% filter(product_grp == "Mx")
+
+# Utility summarizer (handles factor target)
+rate_by <- function(data, group_var, min_n = 30) {
+  data %>%
+    group_by({{ group_var }}) %>%
+    summarize(
+      n = n(),
+      rate = mean(progressed == "Yes"),  # works with factor
+      .groups = "drop"
+    ) %>%
+    filter(n >= min_n)
+}
+
+# --- Persona (function) ---
+rate_by(mx, func_area_grp) %>%
+  ggplot(aes(fct_reorder(func_area_grp, rate), rate)) +
+  geom_col(fill = "#3C8DBC") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Mx Progression by Title Function",
+       x = "Function", y = "Progression Rate") +
+  theme_minimal()
+```
+
+```{r Persona (seniority)}
+
+rate_by(mx, seniority_grp) %>%
+  ggplot(aes(fct_reorder(seniority_grp, rate), rate)) +
+  geom_col(fill = "#8172B3") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Mx Progression by Seniority") +
+  theme_minimal()
+```
+
+```{r Industry}
+
+# Ensure mx uses the processed dataset
+mx <- df_final %>% filter(product_grp == "Mx")
+
+rate_by(mx, industry_grp) %>%
+  ggplot(aes(fct_reorder(industry_grp, rate), rate)) +
+  geom_col(fill = "#4C72B0") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Mx Progression by Industry") +
+  theme_minimal()
+```
+
+```{r Channel}
+
+# Ensure mx is from the correct dataset (df_final or df_model)
+mx <- df_final %>% filter(product_grp == "Mx")
+
+# Define rate_by if not already defined
+rate_by <- function(data, group_var, min_n = 30) {
+  data %>%
+    group_by({{ group_var }}) %>%
+    summarize(
+      n = n(),
+      rate = mean(progressed == "Yes"),
+      .groups = "drop"
+    ) %>%
+    filter(n >= min_n)
+}
+
+# Plot by channel_grp
+rate_by(mx, channel_grp) %>%
+  ggplot(aes(fct_reorder(channel_grp, rate), rate)) +
+  geom_col(fill = "#70AD47") +
+  coord_flip() +
+  labs(title = "Mx Progression by Channel",
+       y = "Progression Rate") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal()
+```
+
+```{r Priority}
+mx_raw <- df_model %>% filter(product_grp == "Mx")
+rate_by(mx_raw, Priority) %>%
+  ggplot(aes(fct_reorder(Priority, rate), rate)) +
+  geom_col(fill = "#ED7D31") +
+  coord_flip() +
+  labs(title = "Mx Progression by Lead Priority",
+       y = "Progression Rate") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal()
+```
+
+# Plots of MX & Qx Relationships
+
+```{r}
+qx_mx <- df_model %>% filter(product_grp %in% c("Qx", "Mx"))
+
+# Utility summarizer (handles factor target)
+rate_by <- function(data, group_var, min_n = 30) {
+  data %>%
+    group_by({{ group_var }}) %>%
+    summarize(n = n(), rate = mean(progressed == "Yes"), .groups = "drop") %>%
+    filter(n >= min_n)
+}
+
+# --- Persona (function) ---
+rate_by(qx_mx, func_area_grp) %>%
+  ggplot(aes(fct_reorder(func_area_grp, rate), rate)) +
+  geom_col(fill = "#3C8DBC") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Qx & Mx Progression by Title Function",
+       x = "Function", y = "Progression Rate") +
+  theme_minimal()
+```
+
+```{r 2nd Persona (seniority)}
+
+rate_by(qx_mx, seniority) %>%
+  ggplot(aes(fct_reorder(seniority, rate), rate)) +
+  geom_col(fill = "#8172B3") +
+  coord_flip() +
+  scale_y_continuous(labels = percent) +
+  labs(title = "qx_mx Progression by Seniority") +
+  theme_minimal()
+```
+
+```{r 2nd Industry}
+
+rate_by(qx_mx, industry_grp) %>%
+  ggplot(aes(fct_reorder(industry_grp, rate), rate)) +
+  geom_col(fill = "#4C72B0") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Qx & Mx Progression by Industry",
+       x = "Industry",
+       y = "Progression Rate") +
+  theme_minimal()
+```
+
+```{r Manufacturing Model}
+rate_by(qx_mx, mfg_model_grp) %>%
+  ggplot(aes(fct_reorder(mfg_model_grp, rate), rate)) +
+  geom_col(fill = "#5B9BD5") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Qx & Mx Progression by Manufacturing Model",
+       x = "Manufacturing Model",
+       y = "Progression Rate") +
+  theme_minimal()
+```
+
+```{r 2nd Channel}
+rate_by(qx_mx, channel_grp) %>%
+  ggplot(aes(fct_reorder(channel_grp, rate), rate)) +
+  geom_col(fill = "#70AD47") +
+  coord_flip() +
+  labs(title = "Qx & Mx Progression by Channel",
+       x = "Channel",
+       y = "Progression Rate") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal()
+```
+
+```{r 2nd Priority}
+
+rate_by(qx_mx, Priority) %>%  # Note: capital P
+  ggplot(aes(fct_reorder(Priority, rate), rate)) +
+  geom_col(fill = "#ED7D31") +
+  coord_flip() +
+  labs(title = "Qx & Mx Progression by Lead Priority",
+       x = "Priority",
+       y = "Progression Rate") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal()
+```
+
+# Modeling
+
+## Train/Test Split & CV
+
+```{r Split}
+set.seed(42)
+splits   <- initial_split(df_final, prop = 0.8, strata = progressed)
+train    <- training(splits)
+test     <- testing(splits)
+cv_folds <- vfold_cv(train, v = 5, strata = progressed)
+```
+
+## Preprocessing Recipe
+
+```{r Recipe}
+rec <- recipe(progressed ~ ., data = train) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_downsample(progressed, under_ratio = 1, seed = 42)
+```
+
+## Benchmark
+
+```{r Benchmark}
+# Majority-class classifier: predict "No"
+cat("Benchmark accuracy (always No):", mean(test$progressed == "No"), "\n")
+cat("Benchmark AUC: 0.50 (random classifier)\n")
+```
+
+```{r Model Benchmark}
+# Helper function: train and evaluate a Random Forest for a single product
+run_product_model <- function(data, product_name) {
+
+  df_sub <- data %>% filter(product_grp == product_name)
+
+  set.seed(42)
+  splits <- initial_split(df_sub, prop = 0.8, strata = progressed)
+  train  <- training(splits)
+  test   <- testing(splits)
+  folds  <- vfold_cv(train, v = 5, strata = progressed)
+
+  rec <- recipe(progressed ~ ., data = train) %>%
+    step_impute_median(all_numeric_predictors()) %>%
+    step_impute_mode(all_nominal_predictors()) %>%
+    step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_numeric_predictors()) %>%
+    step_downsample(progressed, under_ratio = 1, seed = 42)
+
+  rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 500) %>%
+    set_engine("ranger", importance = "impurity") %>%
+    set_mode("classification")
+
+  set.seed(42)
+  rf_tune <- tune_grid(
+    workflow() %>% add_recipe(rec) %>% add_model(rf_spec),
+    resamples = folds,
+    grid = grid_regular(mtry(range = c(3, 8)), min_n(range = c(5, 30)), levels = 4),
+    metrics = metric_set(roc_auc)
+  )
+
+  best_rf  <- select_best(rf_tune, metric = "roc_auc")
+  final_wf <- finalize_workflow(workflow() %>% add_recipe(rec) %>% add_model(rf_spec), best_rf)
+  final_fit <- last_fit(final_wf, splits, metrics = metric_set(roc_auc, f_meas))
+
+  list(
+    product   = product_name,
+    final_wf  = final_wf,
+    final_fit = final_fit,
+    train     = train,
+    cv_auc    = show_best(rf_tune, metric = "roc_auc", n = 1)$mean,
+    test_auc  = collect_metrics(final_fit) %>% filter(.metric == "roc_auc") %>% pull(.estimate)
+  )
+}
+
+mx_result <- run_product_model(df_final, "Mx")
+qx_result <- run_product_model(df_final, "Qx")
+
+# Product-level performance summary
+tibble(
+  Product  = c("Mx", "Qx"),
+  CV_AUC   = c(mx_result$cv_auc,  qx_result$cv_auc),
+  Test_AUC = c(mx_result$test_auc, qx_result$test_auc)
+)
+```
+
+## Logistic Regression
+
+```{r logistic}
+lr_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+lr_wf <- workflow() %>% add_recipe(rec) %>% add_model(lr_spec)
+
+set.seed(42)
+lr_tune <- tune_grid(
+  lr_wf,
+  resamples = cv_folds,
+  grid      = grid_regular(penalty(), mixture(), levels = 5),
+  metrics   = metric_set(roc_auc)
+)
+
+best_lr <- select_best(lr_tune, metric = "roc_auc")
+cat("Best LR - CV AUC:", show_best(lr_tune, metric = "roc_auc", n = 1)$mean, "\n")
+```
+
+## Random Forest
+
+```{r random-forest}
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 500) %>%
+  set_engine("ranger", importance = "impurity", max.depth = 10) %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>% add_recipe(rec) %>% add_model(rf_spec)
+
+set.seed(42)
+rf_tune <- tune_grid(
+  rf_wf,
+  resamples = cv_folds,
+  grid      = grid_regular(mtry(range = c(3, 10)), min_n(range = c(10, 50)), levels = 4),
+  metrics   = metric_set(roc_auc)
+)
+
+best_rf <- select_best(rf_tune, metric = "roc_auc")
+cat("Best RF - CV AUC:", show_best(rf_tune, metric = "roc_auc", n = 1)$mean, "\n")
+```
+
+## XGBoost
+
+```{r xgboost}
+xgb_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(),
+  learn_rate = tune(), min_n = tune(),
+  sample_size = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wf <- workflow() %>% add_recipe(rec) %>% add_model(xgb_spec)
+
+set.seed(42)
+xgb_tune <- tune_grid(
+  xgb_wf,
+  resamples = cv_folds,
+  grid = grid_latin_hypercube(
+    trees(range = c(100, 600)), tree_depth(range = c(3, 8)),
+    learn_rate(range = c(-3, -1)), min_n(range = c(10, 50)),
+    sample_size = sample_prop(),
+    size = 25
+  ),
+  metrics = metric_set(roc_auc)
+)
+
+best_xgb <- select_best(xgb_tune, metric = "roc_auc")
+cat("Best XGB - CV AUC:", show_best(xgb_tune, metric = "roc_auc", n = 1)$mean, "\n")
+```
+
+
+# Model Performance
+
+## CV AUC Comparison
+
+```{r Compare}
+tibble(
+  Model  = c("Logistic Regression", "Random Forest", "XGBoost"),
+  CV_AUC = c(
+    show_best(lr_tune,  metric = "roc_auc", n = 1)$mean,
+    show_best(rf_tune,  metric = "roc_auc", n = 1)$mean,
+    show_best(xgb_tune, metric = "roc_auc", n = 1)$mean
+  )
+) %>% arrange(desc(CV_AUC))
+```
+
+## Final Model: Test Set Evaluation
+
+```{r Final-Eval}
+# Random Forest is highest AUC
+final_wf  <- finalize_workflow(rf_wf, best_rf)
+final_fit <- last_fit(final_wf, splits, metrics = metric_set(roc_auc, accuracy, f_meas))
+
+collect_metrics(final_fit)
+```
+
+## In-Sample vs Out-of-Sample AUC
+
+```{r In-vs-Out}
+# Diagnose overfitting: compare train vs test AUC and flag if gap > 0.05
+diagnose_overfit <- function(result) {
+  final_model <- fit(result$final_wf, data = result$train)
+  train_preds <- augment(final_model, new_data = result$train)
+  test_preds  <- collect_predictions(result$final_fit)
+
+  in_auc  <- roc_auc(train_preds, truth = progressed,
+                     .pred_Yes, event_level = "first")$.estimate
+  out_auc <- result$test_auc
+
+  cat(sprintf(
+    "[%s] Train AUC: %.4f | Test AUC: %.4f | Gap: %.4f %s\n",
+    result$product, in_auc, out_auc, in_auc - out_auc,
+    ifelse(in_auc - out_auc > 0.05, "<- WARNING: overfitting", "OK")
+  ))
+}
+
+diagnose_overfit(mx_result)
+diagnose_overfit(qx_result)
+
+# Find optimal threshold under three business scenarios:
+#   (A) Maximize F1
+#   (B) Precision >= 0.50 (limited sales capacity, avoid wasted effort)
+#   (C) Recall    >= 0.70 (do not miss high-potential leads)
+optimize_threshold <- function(result) {
+  preds <- collect_predictions(result$final_fit)
+
+  map_dfr(seq(0.25, 0.75, by = 0.05), function(t) {
+    p <- preds %>%
+      mutate(.pred_class = factor(if_else(.pred_Yes >= t, "Yes", "No"),
+                                  levels = c("Yes", "No")))
+    tibble(
+      threshold = t,
+      f1        = f_meas(p,    truth = progressed, estimate = .pred_class)$.estimate,
+      precision = precision(p, truth = progressed, estimate = .pred_class)$.estimate,
+      recall    = recall(p,    truth = progressed, estimate = .pred_class)$.estimate
+    )
+  }) -> tbl
+
+  cat(sprintf("\n--- %s threshold optimization ---\n", result$product))
+  cat(sprintf("(A) Max F1:          t=%.2f | F1=%.3f | Prec=%.3f | Rec=%.3f\n",
+    { r <- slice_max(tbl, f1, n=1); r$threshold }, { r <- slice_max(tbl, f1, n=1); r$f1 },
+    { r <- slice_max(tbl, f1, n=1); r$precision }, { r <- slice_max(tbl, f1, n=1); r$recall }))
+  cat(sprintf("(B) Prec >= 0.50:    t=%.2f | F1=%.3f | Prec=%.3f | Rec=%.3f\n",
+    { r <- filter(tbl, precision >= 0.50) %>% slice_max(f1, n=1); r$threshold },
+    { r <- filter(tbl, precision >= 0.50) %>% slice_max(f1, n=1); r$f1 },
+    { r <- filter(tbl, precision >= 0.50) %>% slice_max(f1, n=1); r$precision },
+    { r <- filter(tbl, precision >= 0.50) %>% slice_max(f1, n=1); r$recall }))
+  cat(sprintf("(C) Recall >= 0.70:  t=%.2f | F1=%.3f | Prec=%.3f | Rec=%.3f\n",
+    { r <- filter(tbl, recall >= 0.70) %>% slice_max(f1, n=1); r$threshold },
+    { r <- filter(tbl, recall >= 0.70) %>% slice_max(f1, n=1); r$f1 },
+    { r <- filter(tbl, recall >= 0.70) %>% slice_max(f1, n=1); r$precision },
+    { r <- filter(tbl, recall >= 0.70) %>% slice_max(f1, n=1); r$recall }))
+}
+
+optimize_threshold(mx_result)
+optimize_threshold(qx_result)
+```
+
+```{r Fit}
+# Rebuild test_preds from the combined model final_fit
+test_preds <- collect_predictions(final_fit)
+```
+
+```{r Threshold}
+thresholds <- seq(0.3, 0.7, by = 0.05)
+
+threshold_results <- map_dfr(thresholds, function(t) {
+  preds <- test_preds %>%
+    mutate(.pred_class = factor(
+      if_else(.pred_Yes >= t, "Yes", "No"),
+      levels = c("Yes", "No")
+    ))
+  tibble(
+    threshold = t,
+    f1        = f_meas(preds,    truth = progressed, estimate = .pred_class)$.estimate,
+    precision = precision(preds, truth = progressed, estimate = .pred_class)$.estimate,
+    recall    = recall(preds,    truth = progressed, estimate = .pred_class)$.estimate
+  )
+})
+
+threshold_results
+```
+
+```{r Threshold-apply}
+best_threshold <- threshold_results %>%
+  arrange(desc(f1)) %>%
+  dplyr::slice(1) %>%
+  pull(threshold)
+
+test_preds_adj <- test_preds %>%
+  mutate(.pred_class = factor(
+    if_else(.pred_Yes >= best_threshold, "Yes", "No"),
+    levels = c("Yes", "No")
+  ))
+```
+
+
+## Confusion Matrix
+
+```{r Confusion}
+conf_mat(test_preds_adj, truth = progressed, estimate = .pred_class)
+```
+
+```{r AUC & ROC}
+# Restore out_auc for the combined model ROC plot
+out_auc <- collect_metrics(final_fit) %>% 
+  filter(.metric == "roc_auc") %>% 
+  pull(.estimate)
+```
+
+## ROC Curve
+
+```{r ROC}
+roc_curve(test_preds, truth = progressed, .pred_Yes, event_level = "first") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path() +
+  geom_abline(lty = 2) +
+  labs(title = paste0("ROC Curve (AUC = ", round(out_auc, 3), ")")) +
+  theme_minimal()
+```
+
+```{r Final Model}
+final_model <- fit(final_wf, data = train)
+```
+
+## Variable Importance
+
+```{r Vip}
+final_model %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 15)
+
+# Extract top-N variable importance per product and compare side by side
+extract_vip <- function(result, top_n = 15) {
+  fit(result$final_wf, data = result$train) %>%
+    extract_fit_parsnip() %>%
+    vi() %>%
+    slice_max(Importance, n = top_n) %>%
+    mutate(Product = result$product)
+}
+
+bind_rows(extract_vip(mx_result), extract_vip(qx_result)) %>%
+  select(Product, Variable, Importance) %>%
+  pivot_wider(names_from = Product, values_from = Importance) %>%
+  arrange(desc(coalesce(Mx, 0))) %>%
+  print(n = 20)
+```
+
+
+# Results
+
+We tested three models. Random Forest was the best with a test AUC of 0.855, followed by XGBoost (0.838) and Logistic Regression (0.829). All three scored well above the 0.50 baseline, so the data has clear, usable patterns.
+We also built separate models for Mx and Qx. Both scored above 0.83, meaning we can reliably score leads for both products.
+At the chosen threshold of 0.60, the model catches 72% of leads that would progress. Teams with less capacity can raise the threshold to get a shorter, cleaner list — but they will miss more real leads.
+
+### Business Insights
+
+The single biggest signal is what a lead does, not who they are. Pricing page visits convert at 58% for Mx and 50% for Qx — far above the 18.5% average. Demo requests follow at 25–32%. These leads should be called first, every time.
+Mx and Qx need different targeting. Mx works best with small-to-mid sized Medical Device and Biologics companies in the Americas. Quality and Engineering roles convert the highest at around 16%. Focusing here is the fastest way to close the gap between Mx (12.9%) and Qx (20.3%).
+
+On channels, SEO and Direct/Inbound convert at 24–31% for both products. Online Ads for Mx sit at only 19%. Organic traffic brings better leads, so shifting budget there makes sense.
+Lastly, 40% of records are missing key fields like job title and site function. Leads with missing data convert much less. Making these fields required at sign-up is a simple fix with a real impact.
